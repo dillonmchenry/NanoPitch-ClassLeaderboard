@@ -124,12 +124,10 @@ def load_checkpoint(path):
         RuntimeWarning,
     )
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
-    kwargs = ckpt.get('model_kwargs', {'cond_size': 64, 'gru_size': 96})
+    kwargs = dict(ckpt.get('model_kwargs', {'cond_size': 64, 'gru_size': 96}))
+    kwargs.pop('dropout_p', None)  # legacy checkpoints; model no longer uses dropout
     model = NanoPitch(**kwargs)
     model.load_state_dict(ckpt['state_dict'])
-    # model.eval() sets the model to evaluation mode. This disables dropout
-    # and batch normalization training behavior. NanoPitch doesn't use those,
-    # but it is good practice — and it ensures state_dict values are final.
     model.eval()
     return model, kwargs
 

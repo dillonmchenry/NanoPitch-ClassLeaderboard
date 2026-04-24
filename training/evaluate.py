@@ -245,7 +245,8 @@ def main():
         RuntimeWarning,
     )
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    kwargs = ckpt.get('model_kwargs', {'cond_size': 64, 'gru_size': 96})
+    kwargs = dict(ckpt.get('model_kwargs', {'cond_size': 64, 'gru_size': 96}))
+    kwargs.pop('dropout_p', None)  # legacy checkpoints; model no longer uses dropout
     model = NanoPitch(**kwargs)
     model.load_state_dict(ckpt['state_dict'])
     model.to(args.device)
