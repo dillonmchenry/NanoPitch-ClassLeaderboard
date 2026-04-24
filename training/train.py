@@ -8,16 +8,16 @@ activity in noisy conditions. Here's what happens during training:
 1. LOAD DATA: Pre-extracted mel spectrograms of clean vocals (with
    ground-truth pitch from RMVPE) and environmental noise.
 
-2. AUGMENT: Implemented in ``augment_mel_batch`` (a stub you must fill in).
-   The intended behavior is to mix each clean vocal window with a random
-   noise window at a random SNR so the model sees noisy conditions during
-   training. Until you implement it, training uses clean mel only.
+2. AUGMENT: ``augment_mel_batch`` mixes clean vocal mel with random noise at
+   random SNR (log-domain ``logaddexp``). Optionally, some samples stay clean
+   (``--aug-clean-prob``) to help pitch accuracy on studio-like inputs.
 
 3. PREDICT: Feed the noisy mel spectrogram to the model. It outputs
    VAD probabilities and a pitch posteriorgram.
 
 4. COMPUTE LOSS: Compare predictions against ground truth:
-   - VAD loss: Binary Cross-Entropy (is voice present? yes/no)
+   - VAD loss: Binary Cross-Entropy with optional positive-class weighting
+     (``--vad-pos-weight``) so voiced frames are not drowned out by silence
    - Pitch loss: BCE on the 360-dim posteriorgram, weighted by VAD
      (we only care about pitch accuracy when someone is singing)
 
@@ -81,29 +81,88 @@ parser.add_argument("--device", type=str, default="auto",
 # Model architecture — try changing these to see the effect on quality vs speed!
 parser.add_argument("--cond-size", type=int, default=64,
                     help="conv layer width (bigger = more capacity, slower)")
-parser.add_argument("--gru-size", type=int, default=96,
+parser.add_argument("--gru-size", type=int, default=112,
                     help="GRU hidden size (bigger = more memory, slower)")
 
 # Training hyperparameters
-parser.add_argument("--epochs", type=int, default=50)
+parser.add_argument("--epochs", type=int, default=150)
 parser.add_argument("--batch-size", type=int, default=32,
                     help="samples per gradient update (lower if running out of RAM)")
 parser.add_argument("--lr", type=float, default=1e-3,
-                    help="initial learning rate")
-parser.add_argument("--seq-len", type=int, default=200,
+                    help="initial learning rate (cosine peak)")
+parser.add_argument("--lr-min", type=float, default=1e-5,
+                    help="minimum learning rate for cosine annealing")
+parser.add_argument("--seq-len", type=int, default=400,
                     help="training clip length in frames (200 = 2 seconds)")
 parser.add_argument("--num-workers", type=int, default=0,
                     help="data loading threads (0 = main thread only)")
 
-# Data augmentation (used by augment_mel_batch once implemented)
+# Data augmentation (augment_mel_batch)
 parser.add_argument("--snr-range", type=float, nargs=2, default=[-5.0, 20.0],
                     help="min/max SNR in dB for noise mixing (see augment_mel_batch)")
+parser.add_argument("--aug-clean-prob", type=float, default=0.10,
+                    help="per-sample probability of skipping noise and using clean mel only "
+                         "(0 = always mix; helps RPA on clean-like data while training on noise)")
+parser.add_argument("--aug-clean-prob-late", type=float, default=0.25,
+                    help="optional clean-only probability used in the final training portion")
+parser.add_argument("--aug-clean-late-frac", type=float, default=0.20,
+                    help="final fraction of epochs that use --aug-clean-prob-late")
 
 # Loss weights — adjust to prioritize VAD vs pitch accuracy
-parser.add_argument("--w-vad", type=float, default=0.1,
+parser.add_argument("--w-vad", type=float, default=0.08,
                     help="weight for VAD loss")
-parser.add_argument("--w-pitch", type=float, default=1.0,
+parser.add_argument("--w-pitch", type=float, default=1.1,
                     help="weight for pitch loss")
+
+# VAD class imbalance: voiced frames are often a minority; uniform BCE underweights them
+parser.add_argument("--vad-pos-weight", type=float, default=0.6,
+                    help="multiplier on loss for voiced (positive) VAD frames; "
+                         "1.0 = uniform BCE. Typical ~N_neg/N_voiced (e.g. 2.3 if ~30%% voiced)")
+
+parser.add_argument("--vad-pretrain-epochs", type=int, default=5,
+                    help="number of initial epochs to train VAD head + backbone only (pitch head frozen)")
+parser.add_argument("--pitch-pretrain-epochs", type=int, default=20,
+                    help="number of subsequent epochs to train pitch head + backbone only (VAD head frozen)")
+
+
+def set_training_phase(model, epoch, start_epoch, args):
+    """Freeze/unfreeze heads to stage training.
+
+    Phases are based on absolute epoch count (not steps):
+      1) epochs [start_epoch, start_epoch+vad_pretrain-1]: train VAD + backbone
+      2) next pitch_pretrain_epochs: train pitch + backbone
+      3) rest: joint training
+    """
+    rel = epoch - start_epoch
+    vad_only = rel < args.vad_pretrain_epochs
+    pitch_only = (not vad_only) and (rel < args.vad_pretrain_epochs + args.pitch_pretrain_epochs)
+
+    if vad_only:
+        for p in model.dense_pitch.parameters():
+            p.requires_grad = False
+        for p in model.dense_vad.parameters():
+            p.requires_grad = True
+        phase = "vad_only"
+    elif pitch_only:
+        for p in model.dense_vad.parameters():
+            p.requires_grad = False
+        for p in model.dense_pitch.parameters():
+            p.requires_grad = True
+        phase = "pitch_only"
+    else:
+        for p in model.dense_vad.parameters():
+            p.requires_grad = True
+        for p in model.dense_pitch.parameters():
+            p.requires_grad = True
+        phase = "joint"
+
+    # Backbone always trains (conv + GRUs)
+    for name, module in model.named_modules():
+        if name in ["conv1", "conv2", "gru1", "gru2", "gru3"]:
+            for p in module.parameters():
+                p.requires_grad = True
+
+    return phase
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -117,8 +176,7 @@ class NanoPitchDataset(Dataset):
     """PyTorch Dataset that serves (clean_mel, noise_mel, vad, pitch) tuples.
 
     Noise mixing is applied in ``augment_mel_batch`` in the training loop,
-    not here — so each epoch can see different random mixtures once that
-    function is implemented.
+    not here — so each epoch can see different random mixtures.
     """
 
     def __init__(self, data_dir, seq_len=200):
@@ -145,6 +203,12 @@ class NanoPitchDataset(Dataset):
               f"{len(self.clean_segments)} usable segments")
         print(f"  Noise: {len(self.noise_mel):,} frames, "
               f"{len(self.noise_segments)} usable segments")
+
+        voiced_frac = float(np.mean(self.clean_vad > 0.5))
+        if voiced_frac > 0:
+            suggest = (1.0 - voiced_frac) / voiced_frac
+            print(f"  VAD labels: {100.0 * voiced_frac:.1f}% voiced "
+                  f"(class balance ratio N_neg/N_pos ≈ {suggest:.2f})")
 
         self.rng = np.random.default_rng()
 
@@ -183,35 +247,35 @@ class NanoPitchDataset(Dataset):
         return mel_clean, mel_noise, vad, f0
 
 
-def augment_mel_batch(mel_clean, mel_noise, snr_range, device):
-    """Training-time augmentation: mix clean and noise log-mel.
+def augment_mel_batch(mel_clean, mel_noise, snr_range, device, clean_prob=0.0):
+    """Training-time augmentation: mix clean and noise in log-mel domain.
+
+    Linear-domain power addition corresponds to ``logaddexp`` on log-power mels.
+    Each batch row gets its own SNR. With ``clean_prob > 0``, some rows are
+    left as clean mel (no noise) so pitch training still sees studio-like input.
 
     Parameters
     ----------
     mel_clean, mel_noise : Tensor, shape (B, T, N_MELS), on ``device``
     snr_range : (float, float) — min and max SNR in dB (see ``--snr-range``)
     device : torch.device
+    clean_prob : float
+        Probability per sample of returning ``mel_clean`` unchanged (no noise).
 
     Returns
     -------
     Tensor (B, T, N_MELS) — mel passed to the model.
-
-    Student exercise
-    ----------------
-    Implement random SNR mixing. For each batch row, draw ``snr_db`` uniformly
-    from ``snr_range``, convert to a log-domain gain, and combine clean and
-    noise with ``torch.logaddexp`` for numerical stability, e.g.::
-
-        B = mel_clean.size(0)
-        snr_db = (torch.rand(B, 1, 1, device=device)
-                  * (snr_range[1] - snr_range[0]) + snr_range[0])
-        gain_offset = -snr_db * (np.log(10.0) / 20.0)
-        return torch.logaddexp(mel_clean, mel_noise + gain_offset)
-
-    This stub returns ``mel_clean`` unchanged so the trainer runs without
-    augmentation until you add the above (or your own variant).
     """
-    return mel_clean
+    B = mel_clean.size(0)
+    low, high = float(snr_range[0]), float(snr_range[1])
+    snr_db = torch.rand(B, 1, 1, device=device) * (high - low) + low
+    gain_offset = -snr_db * (np.log(10.0) / 20.0)
+    mixed = torch.logaddexp(mel_clean, mel_noise + gain_offset)
+    cp = max(0.0, min(1.0, float(clean_prob)))
+    if cp <= 0.0:
+        return mixed
+    use_clean = torch.rand(B, 1, 1, device=device) < cp
+    return torch.where(use_clean, mel_clean, mixed)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -219,7 +283,7 @@ def augment_mel_batch(mel_clean, mel_noise, snr_range, device):
 # ═══════════════════════════════════════════════════════════════════════
 
 def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
-                    epoch, device, args):
+                    epoch, device, args, clean_prob):
     model.train()  # enable dropout, batch norm, etc. (if any)
     bce = nn.BCELoss(reduction='none')  # per-element BCE, we'll weight manually
     running = {'loss': 0, 'vad': 0, 'pitch': 0}
@@ -242,16 +306,31 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
             pg = f0_to_posteriorgram(f0_np[b], n_frames=T)
             pitch_target[b] = torch.from_numpy(pg)
 
-        # ── Data augmentation (implement in augment_mel_batch) ──
-        mel_mix = augment_mel_batch(mel_clean, mel_noise, args.snr_range, device)
+        # ── Data augmentation (random SNR mix + optional clean-only samples) ──
+        mel_mix = augment_mel_batch(
+            mel_clean, mel_noise, args.snr_range, device,
+            clean_prob=clean_prob,
+        )
 
         # ── Forward Pass ──
         # Causal convs → output same length as input, no trimming needed
         pred_vad, pred_pitch, _ = model(mel_mix)
 
         # ── Loss Computation ──
-        # VAD loss: standard binary cross-entropy
-        vad_loss = bce(pred_vad.squeeze(-1), vad_target).mean()
+        # VAD loss: BCE with optional positive-class weight (like BCEWithLogitsLoss pos_weight).
+        # Uniform mean BCE treats every frame equally; when most frames are unvoiced, gradients
+        # favor predicting silence — pos_weight rebalances so missed voiced frames cost more.
+        vad_bce = bce(pred_vad.squeeze(-1), vad_target)
+        if args.vad_pos_weight != 1.0:
+            pw = args.vad_pos_weight
+            w = torch.where(
+                vad_target > 0.5,
+                torch.full_like(vad_target, pw),
+                torch.ones_like(vad_target),
+            )
+            vad_loss = (w * vad_bce).mean()
+        else:
+            vad_loss = vad_bce.mean()
 
         # Pitch loss: BCE on the 360-dim posteriorgram, but weighted
         # by VAD — we don't penalize pitch errors on silent frames
@@ -451,23 +530,15 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                    betas=(0.8, 0.98), eps=1e-8)
 
-    # Learning rate scheduler — student exercise.
-    #
-    # The stub below holds the learning rate constant throughout training.
-    # Replace it with a real schedule to improve convergence — for example:
-    #
-    #   Cosine annealing with warm restarts (Loshchilov & Hutter, 2017):
-    #     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    #         optimizer, T_0=10, T_mult=2, eta_min=1e-5)
-    #
-    #   Simple inverse-decay:
-    #     scheduler = torch.optim.lr_scheduler.LambdaLR(
-    #         optimizer, lr_lambda=lambda step: 1.0 / (1.0 + 5e-5 * step))
-    #
-    # Call scheduler.step() once per batch (inside train_one_epoch) or once
-    # per epoch (here, after train_one_epoch returns), depending on the type.
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: 1.0)  # constant LR — replace me
+    # Cosine annealing: LR decays smoothly from --lr to --lr-min over all
+    # optimizer steps in this run. train_one_epoch calls scheduler.step()
+    # once per batch, so T_max = batches_per_epoch * epochs.
+    steps_per_epoch = len(dataloader)
+    total_steps = max(1, steps_per_epoch * args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps, eta_min=args.lr_min)
+    print(f"  LR schedule: cosine T_max={total_steps} steps "
+          f"({steps_per_epoch}/epoch), eta_min={args.lr_min}")
 
     # TensorBoard writer for visualizing training progress
     writer = SummaryWriter(log_dir=os.path.join(output_dir, "tb"))
@@ -475,11 +546,17 @@ def main():
     # ── Training loop ──
     best_loss = float("inf")
     for epoch in range(start_epoch, start_epoch + args.epochs):
+        phase = set_training_phase(model, epoch, start_epoch, args)
+        rel_epoch = epoch - start_epoch
+        late_start = int((1.0 - max(0.0, min(1.0, float(args.aug_clean_late_frac)))) * args.epochs)
+        clean_prob = args.aug_clean_prob
+        if args.aug_clean_prob_late is not None and rel_epoch >= late_start:
+            clean_prob = args.aug_clean_prob_late
         t0 = time.time()
         train_loss = train_one_epoch(model, dataloader, optimizer, scheduler,
-                                     writer, epoch, device, args)
+                                     writer, epoch, device, args, clean_prob)
         dt = time.time() - t0
-        print(f"  Epoch {epoch} done in {dt:.1f}s, loss={train_loss:.5f}")
+        print(f"  Epoch {epoch} ({phase}) done in {dt:.1f}s, loss={train_loss:.5f}")
 
         # Evaluate every 5 epochs (and on the first epoch)
         if epoch % 5 == 0 or epoch == start_epoch:

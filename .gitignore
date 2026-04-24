@@ -16,3 +16,7 @@ __pycache__/
 
 # macOS / editor noise
 .DS_Store
+
+training/runs/
+**/checkpoints/*.pth
+**/tb/events.out.tfevents.*
